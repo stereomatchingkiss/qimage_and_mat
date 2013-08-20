@@ -1,98 +1,179 @@
-#include <cstring>
+#include <opencv2/core/core.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+
+#include <QImage>
 
 #include "openCVToQt.hpp"
 
 namespace
 {
-  template<typename T>
-  inline QImage reference_mat_to_qimage(cv::Mat &mat, QImage::Format format)
-  {
-      return QImage((T*)(mat.data), mat.cols, mat.rows, mat.step, format);
-  }  
 
-  QImage copy_mat_to_qimage(cv::Mat const &mat, QImage::Format format)
-  {
-      QImage image(mat.cols, mat.rows, format);
-      for (int i = 0; i != mat.rows; ++i){
-          memcpy(image.scanLine(i), mat.ptr(i), image.bytesPerLine() );
-      }
-
-      return image;
-  }
+inline QImage mat_to_qimage_ref_policy(cv::Mat &mat, QImage::Format format)
+{
+    return QImage(mat.data, mat.cols, mat.rows, mat.step, format);
 }
 
-cv::Mat copy_qimage_to_mat_policy::start(QImage const &img, int format)
+inline QImage mat_to_qimage_cpy_policy(cv::Mat const &mat, QImage::Format format)
 {
-    cv::Mat mat(img.height(), img.width(), format);
-    for(int i = 0; i != mat.rows; ++i){
-        memcpy(mat.ptr(i), img.scanLine(i), img.bytesPerLine());
-    }
-
-    return mat;
+    return QImage(mat.data, mat.cols, mat.rows, mat.step, format).copy();
 }
 
-QImage mat_to_qimage_cpy(cv::Mat &mat, int qimage_format)
+/**
+ * @brief copy QImage into cv::Mat
+ */
+struct qimage_to_mat_cpy_policy
 {
-    switch(mat.type()){
-
-    case CV_8UC3 :
+    static cv::Mat start(QImage const &img, int format)
     {
-        cv::cvtColor(mat, mat, CV_BGR2RGB);
+        return cv::Mat(img.height(), img.width(), format, const_cast<uchar*>(img.bits()), img.bytesPerLine()).clone();
+    }
+};
 
-        return copy_mat_to_qimage(mat, QImage::Format_RGB888);
+/**
+ * @brief make Qimage and cv::Mat share the same buffer, the resource
+ * of the cv::Mat must not deleted before the QImage finish
+ * the jobs.
+ */
+struct qimage_to_mat_ref_policy
+{
+    static cv::Mat start(QImage &img, int format)
+    {
+        return cv::Mat(img.height(), img.width(), format, img.bits(), img.bytesPerLine());
+    }
+};
+
+/**
+ * @brief generic class for reducing duplicate codes
+ */
+template<typename Policy>
+struct qimage_to_mat
+{
+    template<typename Image>
+    static cv::Mat run(Image &&img, bool swap);
+};
+
+/**
+ *@brief transform QImage to cv::Mat
+ *@param img : input image
+ *@param swap : true : swap RGB to BGR; false, do nothing
+ */
+template<typename Policy>
+template<typename Image>
+cv::Mat qimage_to_mat<Policy>::run(Image &&img, bool swap)
+{
+    if(img.isNull()){
+        return cv::Mat();
     }
 
-    case CV_8U :
-    {
-        return copy_mat_to_qimage(mat, QImage::Format_Indexed8);
-    }
-
-    case CV_8UC4 :
-    {
-        if(qimage_format == -1)
-        {
-            return copy_mat_to_qimage(mat, QImage::Format_ARGB32);
+    switch (img.format()) {
+    case QImage::Format_RGB888:{
+        cv::Mat result = Policy::start(img, CV_8UC3);
+        if(swap){
+            cv::cvtColor(result, result, CV_RGB2BGR);
         }
-        else
-        {
-            return copy_mat_to_qimage(mat, QImage::Format(qimage_format));
-        }
+        return result;
+    }
+    case QImage::Format_Indexed8:{
+        return Policy::start(img, CV_8U);
+    }
+    case QImage::Format_RGB32:
+    case QImage::Format_ARGB32:
+    case QImage::Format_ARGB32_Premultiplied:{
+        return Policy::start(img, CV_8UC4);
+    }
+    default:
+        break;
     }
 
-    default :
-        return QImage();
-    }
+    return cv::Mat();
 }
 
-QImage mat_to_qimage_ref(cv::Mat &mat, int qimage_format)
+}
+
+/**
+ *@brief copy cv::Mat into QImage
+ *
+ *@param mat : input mat
+ *@param swap : true : swap RGB to BGR; false, do nothing
+ */
+QImage mat_to_qimage_cpy(cv::Mat const &mat, bool swap)
 {
-    typedef unsigned char UC;    
+    if(!mat.empty()){
+        switch(mat.type()){
 
-    switch(mat.type()){
-
-    case CV_8UC3 :
-    {        
-        cv::cvtColor(mat, mat, CV_BGR2RGB);
-
-        return reference_mat_to_qimage<UC>(mat, QImage::Format_RGB888);
-    }
-
-    case CV_8U :
-    {
-        return reference_mat_to_qimage<UC>(mat, QImage::Format_Indexed8);
-    }
-
-    case CV_8UC4 :
-    {        
-        if(qimage_format == -1){
-          return reference_mat_to_qimage<UC>(mat, QImage::Format_ARGB32);
+        case CV_8UC3 :{
+            if(swap){
+                return mat_to_qimage_cpy_policy(mat, QImage::Format_RGB888).rgbSwapped();
+            }else{
+                return mat_to_qimage_cpy_policy(mat, QImage::Format_RGB888);
+            }
         }
-        else{
-          return reference_mat_to_qimage<UC>(mat, QImage::Format(qimage_format));
+
+        case CV_8U :{
+            return mat_to_qimage_cpy_policy(mat, QImage::Format_Indexed8);
+        }
+
+        case CV_8UC4 :{            
+           return mat_to_qimage_cpy_policy(mat, QImage::Format_ARGB32);
+        }
+
         }
     }
 
-    default :
-        return QImage();
+    return QImage();
+}
+
+/**
+ *@brief make Qimage and cv::Mat share the same buffer, the resource
+ * of the cv::Mat must not deleted before the QImage finish
+ * the jobs.
+ *
+ *@param mat : input mat
+ *@param swap : true : swap RGB to BGR; false, do nothing
+ */
+QImage mat_to_qimage_ref(cv::Mat &mat, bool swap)
+{
+    if(!mat.empty()){
+        switch(mat.type()){
+
+        case CV_8UC3 :{
+            if(swap){
+                cv::cvtColor(mat, mat, CV_BGR2RGB);
+            }
+
+            return mat_to_qimage_ref_policy(mat, QImage::Format_RGB888);
+        }
+
+        case CV_8U :{
+            return mat_to_qimage_ref_policy(mat, QImage::Format_Indexed8);
+        }
+
+        case CV_8UC4 :{            
+            return mat_to_qimage_ref_policy(mat, QImage::Format_ARGB32);
+        }
+
+        }
     }
+
+    return QImage();
+}
+
+/**
+ *@brief transform QImage to cv::Mat by copy QImage to cv::Mat
+ *@param img : input image
+ *@param swap : true : swap RGB to BGR; false, do nothing
+ */
+cv::Mat qimage_to_mat_cpy(QImage const &img, bool swap)
+{
+    return qimage_to_mat<qimage_to_mat_cpy_policy>::run(img, swap);
+}
+
+/**
+ *@brief transform QImage to cv::Mat by sharing the buffer
+ *@param img : input image
+ *@param swap : true : swap RGB to BGR; false, do nothing
+ */
+cv::Mat qimage_to_mat_ref(QImage &img, bool swap)
+{
+    return qimage_to_mat<qimage_to_mat_ref_policy>::run(img, swap);
 }
